@@ -305,6 +305,15 @@ extern "C"
     void batch_generate_release(int request_id) {
         gpttype_batch_generate_release(request_id);
     }
+    generation_stats_outputs batch_generate_stats(int request_id) {
+        return gpttype_batch_generate_stats(request_id);
+    }
+    generation_stats_outputs generate_stats(int known_serial) {
+        return gpttype_generate_stats(known_serial);
+    }
+    int get_generation_serial() {
+        return gpttype_get_generation_serial();
+    }
     bool has_audio_support()
     {
         return audio_multimodal_supported;

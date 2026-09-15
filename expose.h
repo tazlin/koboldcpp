@@ -160,6 +160,22 @@ struct generation_outputs
     int completion_tokens = 0;
     const char * text; //response will now be stored in c++ allocated memory
 };
+struct generation_stats_outputs
+{
+    int status = 0; //1 for a known request; ignore other fields when 0
+    int state = -1; //BatchState: 0 waiting, 1 prefill, 2 generating, 3 finished, 4 failed, 5 aborted
+    int slot = -1;
+    int queue_position = -1; //position among waiting requests, -1 once scheduled
+    int prompt_tokens = 0;
+    int completion_tokens = 0; //grows while generating
+    int max_length = 0;
+    float init_seconds = 0.0f;
+    float process_seconds = 0.0f; //prompt processing, live while in prefill
+    float generation_seconds = 0.0f; //live while generating, final once finished
+    float elapsed_seconds = 0.0f; //since the request was scheduled, frozen at finish
+    int finish_reason = stop_reason::INVALID;
+    int finished = 0; //1 once the request has finished, failed or been aborted
+};
 struct token_count_outputs
 {
     int count = 0;
@@ -423,3 +439,6 @@ const char * gpttype_batch_generate_pending_output(int request_id);
 generation_outputs gpttype_batch_generate_result(int request_id);
 bool gpttype_batch_generate_abort(int request_id);
 void gpttype_batch_generate_release(int request_id);
+generation_stats_outputs gpttype_batch_generate_stats(int request_id);
+generation_stats_outputs gpttype_generate_stats(int known_serial);
+int gpttype_get_generation_serial();

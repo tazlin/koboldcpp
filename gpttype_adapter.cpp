@@ -4306,6 +4306,60 @@ enum class BatchState
     ABORTED,
 };
 
+// All progress state, including the serial and generated_tokens, is protected by
+// concat_output_mtx. Pollers never read the mutable legacy performance counters.
+static int generation_serial = 0;
+static generation_stats_outputs generation_progress;
+static std::chrono::steady_clock::time_point generation_start_time;
+
+class GenerationProgressGuard
+{
+public:
+    explicit GenerationProgressGuard(int max_length)
+    {
+        std::lock_guard<std::mutex> lock(concat_output_mtx);
+        generated_tokens.clear();
+        generation_progress = generation_stats_outputs{};
+        generation_progress.status = 1;
+        generation_progress.state = (int) BatchState::GENERATING;
+        generation_progress.max_length = max_length;
+        generation_start_time = std::chrono::steady_clock::now();
+        ++generation_serial;
+    }
+
+    void finish(const generation_outputs & result, float process_seconds,
+                float generation_seconds, bool aborted)
+    {
+        std::lock_guard<std::mutex> lock(concat_output_mtx);
+        generation_progress.state = (int) (result.status != 1 ? BatchState::FAILED :
+            (aborted ? BatchState::ABORTED : BatchState::FINISHED));
+        generation_progress.prompt_tokens = result.prompt_tokens;
+        generation_progress.completion_tokens = result.completion_tokens;
+        generation_progress.process_seconds = process_seconds;
+        generation_progress.generation_seconds = generation_seconds;
+        generation_progress.finish_reason = result.stopreason;
+        generation_progress.elapsed_seconds = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - generation_start_time).count();
+        generation_progress.finished = 1;
+        finalized = true;
+    }
+
+    ~GenerationProgressGuard()
+    {
+        // Early returns and exceptions must not leave a live or stale snapshot.
+        if(!finalized)
+        {
+            generation_outputs failed;
+            failed.status = 0;
+            failed.stopreason = stop_reason::ERROR_ENCOUNTERED;
+            finish(failed, 0.0f, 0.0f, false);
+        }
+    }
+
+private:
+    bool finalized = false;
+};
+
 struct BatchGenerateRequest
 {
     int id = 0;
@@ -4347,6 +4401,8 @@ struct BatchGenerateRequest
     std::chrono::steady_clock::time_point generation_start_time;
     float init_time = 0.0f;
     float process_time = 0.0f;
+    float generation_time = 0.0f; //final generation duration
+    std::chrono::steady_clock::time_point finish_time;
     stop_reason finish_reason = stop_reason::INVALID;
     bool abort_requested = false;
     generation_outputs result;
@@ -4691,6 +4747,9 @@ static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason 
     float processed_tps = process_time > 0.0f ? (float) req.prompt_token_count / process_time : 0.0f;
     float generated_tps = gen_time > 0.0f ? (float) req.completion_token_count / gen_time : 0.0f;
     req.finish_reason = reason;
+    req.process_time = process_time;
+    req.generation_time = gen_time;
+    req.finish_time = finish_time;
     req.result.status = (reason == stop_reason::ERROR_ENCOUNTERED) ? 0 : 1;
     req.result.stopreason = reason;
     req.result.prompt_tokens = req.prompt_token_count;
@@ -5106,6 +5165,80 @@ void gpttype_batch_generate_release(int request_id)
         return req && req->id == request_id && !batch_is_live_state(req->state);
     }), batch_requests.end());
     batch_cv.notify_all();
+}
+
+generation_stats_outputs gpttype_batch_generate_stats(int request_id)
+{
+    generation_stats_outputs out;
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    BatchGenerateRequest * req = batch_find_request_locked(request_id);
+    if(!req)
+    {
+        return out;
+    }
+    auto now = std::chrono::steady_clock::now();
+    bool live = batch_is_live_state(req->state);
+    auto reference = live ? now : req->finish_time;
+    out.status = 1;
+    out.state = (int) req->state;
+    out.slot = req->slot;
+    for(size_t i = 0; i < batch_waiting.size(); ++i)
+    {
+        if(batch_waiting[i] == request_id)
+        {
+            out.queue_position = (int) i;
+            break;
+        }
+    }
+    out.prompt_tokens = req->prompt_token_count;
+    out.completion_tokens = req->completion_token_count;
+    out.max_length = req->max_length;
+    out.init_seconds = req->init_time;
+    out.process_seconds = req->process_time;
+    bool prefill_running = live && req->process_start_time.time_since_epoch().count() != 0 && req->generation_start_time.time_since_epoch().count() == 0;
+    if(prefill_running)
+    {
+        out.process_seconds = std::chrono::duration<float>(now - req->process_start_time).count();
+    }
+    if(live)
+    {
+        out.generation_seconds = req->generation_start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(now - req->generation_start_time).count();
+    }
+    else
+    {
+        out.generation_seconds = req->generation_time;
+    }
+    bool elapsed_known = req->start_time.time_since_epoch().count() != 0 && reference.time_since_epoch().count() != 0;
+    out.elapsed_seconds = elapsed_known ? std::chrono::duration<float>(reference - req->start_time).count() : 0.0f;
+    out.finish_reason = (int) req->finish_reason;
+    out.finished = live ? 0 : 1;
+    return out;
+}
+
+generation_stats_outputs gpttype_generate_stats(int known_serial)
+{
+    std::lock_guard<std::mutex> lock(concat_output_mtx);
+    if(known_serial == generation_serial)
+    {
+        generation_stats_outputs waiting;
+        waiting.status = 1;
+        waiting.state = (int) BatchState::WAITING;
+        return waiting;
+    }
+    auto out = generation_progress;
+    if(!out.finished)
+    {
+        out.completion_tokens = (int) generated_tokens.size();
+        out.elapsed_seconds = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - generation_start_time).count();
+    }
+    return out;
+}
+
+int gpttype_get_generation_serial()
+{
+    std::lock_guard<std::mutex> lock(concat_output_mtx);
+    return generation_serial;
 }
 
 std::string gpttype_get_chat_template()
@@ -5648,6 +5781,7 @@ int smartcache_quick_snapshot(int specific_slot = -1)
 generation_outputs gpttype_generate(const generation_inputs inputs)
 {
     BatchLegacyGuard batch_legacy_guard;
+    GenerationProgressGuard progress_guard(inputs.max_length);
     generation_outputs output;
 
     if(kcpp_data==nullptr)
@@ -5671,7 +5805,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     generation_finished = false; // Set current generation status
     {
         std::lock_guard<std::mutex> lock(concat_output_mtx);
-        generated_tokens.clear(); // New Generation, new tokens
         generated_tokens.reserve(16);
     }
     delayed_generated_tokens.clear();
@@ -7501,6 +7634,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     concat_output_reader_copy_res = concat_output;
     concat_output_mtx.unlock();
     output.text = concat_output_reader_copy_res.c_str();
+    progress_guard.finish(output, process_time, gen_time, early_abort.load());
     generation_finished = true;
     return output;
 }
