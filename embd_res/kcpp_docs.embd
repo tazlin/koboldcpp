@@ -488,6 +488,14 @@
                             "type": "integer",
                             "description": "Length of generation queue."
                          },
+                         "batch_queue_depth": {
+                            "type": "integer",
+                            "description": "Batched requests waiting to run."
+                         },
+                         "batch_active": {
+                            "type": "integer",
+                            "description": "Batched requests not yet finished, including those still waiting."
+                         },
                          "idle": {
                             "type": "integer",
                             "description": "Status of backend, busy or idle."
@@ -806,6 +814,8 @@
                                     "total_tts_gens": 0,
                                     "total_transcribe_gens": 0,
                                     "queue": 0,
+                                    "batch_queue_depth": 0,
+                                    "batch_active": 2,
                                     "idle": 0,
                                     "hordeexitcounter": -1,
                                     "uptime": 2255,

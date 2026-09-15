@@ -1033,6 +1033,8 @@ def init_library():
     handle.batch_generate_release.restype = None
     handle.batch_generate_stats.argtypes = [ctypes.c_int]
     handle.batch_generate_stats.restype = generation_stats_outputs
+    handle.batch_generate_queue_depth.restype = ctypes.c_int
+    handle.batch_generate_active_count.restype = ctypes.c_int
     handle.generate_stats.argtypes = [ctypes.c_int]
     handle.generate_stats.restype = generation_stats_outputs
     handle.get_generation_serial.restype = ctypes.c_int
@@ -6739,6 +6741,8 @@ Change Mode<br>
                     "total_transcribe_gens": totaltranscribegens,
                     "queue": requestsinqueue,
                     "idle": (0 if (modelbusy.locked() or batched_request_runner_count>0) else 1),
+                    "batch_queue_depth": handle.batch_generate_queue_depth(),
+                    "batch_active": handle.batch_generate_active_count(),
                     "hordeexitcounter": exitcounter,
                     "uptime": uptime,
                     "idletime": idletime,

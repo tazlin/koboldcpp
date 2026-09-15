@@ -5241,6 +5241,26 @@ int gpttype_get_generation_serial()
     return generation_serial;
 }
 
+int gpttype_batch_generate_queue_depth()
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    return (int) batch_waiting.size();
+}
+
+int gpttype_batch_generate_active_count()
+{
+    std::lock_guard<std::mutex> lock(batch_mutex);
+    int active = 0;
+    for(auto & req : batch_requests)
+    {
+        if(req && batch_is_live_state(req->state))
+        {
+            active++;
+        }
+    }
+    return active;
+}
+
 std::string gpttype_get_chat_template()
 {
     if(kcpp_data==nullptr)

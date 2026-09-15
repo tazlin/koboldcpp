@@ -308,6 +308,12 @@ extern "C"
     generation_stats_outputs batch_generate_stats(int request_id) {
         return gpttype_batch_generate_stats(request_id);
     }
+    int batch_generate_queue_depth() {
+        return gpttype_batch_generate_queue_depth();
+    }
+    int batch_generate_active_count() {
+        return gpttype_batch_generate_active_count();
+    }
     generation_stats_outputs generate_stats(int known_serial) {
         return gpttype_generate_stats(known_serial);
     }

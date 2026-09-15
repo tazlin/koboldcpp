@@ -440,5 +440,8 @@ generation_outputs gpttype_batch_generate_result(int request_id);
 bool gpttype_batch_generate_abort(int request_id);
 void gpttype_batch_generate_release(int request_id);
 generation_stats_outputs gpttype_batch_generate_stats(int request_id);
+int gpttype_batch_generate_queue_depth();
+// All unfinished requests, including those counted by queue_depth.
+int gpttype_batch_generate_active_count();
 generation_stats_outputs gpttype_generate_stats(int known_serial);
 int gpttype_get_generation_serial();
