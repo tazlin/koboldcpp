@@ -368,7 +368,7 @@ extern "C"
         return total_transcribe_gens;
     }
     int get_last_stop_reason() {
-        return (int)last_stop_reason;
+        return (int)last_stop_reason.load();
     }
 
     static std::string chat_template = "";

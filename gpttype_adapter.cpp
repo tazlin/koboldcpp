@@ -80,15 +80,15 @@ int speculative_chunk_amt = 4; //do it in chunks of this many tokens
 std::atomic<bool> generation_finished;
 bool audio_multimodal_supported = false;
 bool vision_multimodal_supported = false;
-float last_process_time = 0;
-float last_eval_time = 0;
-int last_token_count = 0;
-int last_input_count = 0;
-int last_seed = -1;
-int total_gens = 0;
-int last_draft_success = 0;
-int last_draft_failed = 0;
-stop_reason last_stop_reason = stop_reason::INVALID;
+std::atomic<float> last_process_time = 0;
+std::atomic<float> last_eval_time = 0;
+std::atomic<int> last_token_count = 0;
+std::atomic<int> last_input_count = 0;
+std::atomic<int> last_seed = -1;
+std::atomic<int> total_gens = 0;
+std::atomic<int> last_draft_success = 0;
+std::atomic<int> last_draft_failed = 0;
+std::atomic<stop_reason> last_stop_reason = stop_reason::INVALID;
 std::vector<std::string> generated_tokens;
 static int continuous_batching_slots = 0;
 
