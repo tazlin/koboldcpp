@@ -4750,6 +4750,19 @@ static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason 
     req.process_time = process_time;
     req.generation_time = gen_time;
     req.finish_time = finish_time;
+    //Update /api/extra/perf with this request's results; timings are milliseconds per token.
+    last_process_time = req.prompt_token_count > 0 && process_time > 0.0f ? (process_time * 1000.0f) / (float) req.prompt_token_count : 0.0f;
+    last_eval_time = req.completion_token_count > 0 && gen_time > 0.0f ? (gen_time * 1000.0f) / (float) req.completion_token_count : 0.0f;
+    last_token_count = req.completion_token_count;
+    last_input_count = req.prompt_token_count;
+    last_stop_reason = reason;
+    last_seed = req.sampler && req.temperature > 0.0f ? (int) llama_sampler_get_seed(req.sampler) : req.seed;
+    last_draft_success = 0;
+    last_draft_failed = 0;
+    if(reason != stop_reason::ERROR_ENCOUNTERED)
+    {
+        total_gens += 1;
+    }
     req.result.status = (reason == stop_reason::ERROR_ENCOUNTERED) ? 0 : 1;
     req.result.stopreason = reason;
     req.result.prompt_tokens = req.prompt_token_count;
