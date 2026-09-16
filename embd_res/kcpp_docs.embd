@@ -374,6 +374,70 @@
                       ],
                       "type": "object"
                    },
+                   "GenerationStats": {
+                      "properties": {
+                         "found": {
+                            "type": "boolean",
+                            "description": "Whether stats exist for this genkey. When false, no other fields are returned."
+                         },
+                         "batched": {
+                            "type": "boolean",
+                            "description": "Whether this is a batched request. Without parallelrequests there is no slot, queue position or setup time, and timings are only known once finished."
+                         },
+                         "state": {
+                            "type": "integer",
+                            "description": "State of the request. WAITING=0, PREFILL=1, GENERATING=2, FINISHED=3, FAILED=4, ABORTED=5. Without parallelrequests, WAITING until the generation starts, then GENERATING."
+                         },
+                         "slot": {
+                            "type": "integer",
+                            "description": "Batch slot in use, or -1 if none."
+                         },
+                         "queue_position": {
+                            "type": "integer",
+                            "description": "Position in the batch queue, or -1 once running."
+                         },
+                         "prompt_tokens": {
+                            "type": "integer",
+                            "description": "Prompt token count. Zero until known."
+                         },
+                         "completion_tokens": {
+                            "type": "integer",
+                            "description": "Tokens generated so far."
+                         },
+                         "max_length": {
+                            "type": "integer",
+                            "description": "The max_length of the request."
+                         },
+                         "init_seconds": {
+                            "type": "number",
+                            "description": "Setup time in seconds."
+                         },
+                         "process_seconds": {
+                            "type": "number",
+                            "description": "Prompt processing time in seconds."
+                         },
+                         "generation_seconds": {
+                            "type": "number",
+                            "description": "Generation time in seconds."
+                         },
+                         "elapsed_seconds": {
+                            "type": "number",
+                            "description": "Time since the request started running, in seconds. Does not include time spent in the queue."
+                         },
+                         "finish_reason": {
+                            "type": "integer",
+                            "description": "Reason the generation stopped. ERROR=-2, INVALID=-1, OUT_OF_TOKENS=0, EOS_TOKEN_HIT=1, CUSTOM_STOPPER=2. INVALID while still running."
+                         },
+                         "finished": {
+                            "type": "boolean",
+                            "description": "Whether the generation has finished."
+                         }
+                      },
+                      "required": [
+                         "found"
+                      ],
+                      "type": "object"
+                   },
                    "KcppPerf": {
                       "properties": {
                          "last_process": {
@@ -952,6 +1016,66 @@
                          }
                       },
                       "summary": "Generate text with a specified prompt. SSE streamed results.",
+                      "tags": [
+                         "api/extra"
+                      ]
+                   }
+                },
+                "/api/extra/generate/stats": {
+                   "post": {
+                      "description": "Poll the token counts and timings of the currently ongoing text generation. A unique genkey previously submitted allows polling a specific request, including when parallelrequests is enabled.",
+                      "requestBody": {
+                         "content": {
+                            "application/json": {
+                               "example": {
+                                  "genkey": "KCPP2342"
+                               },
+                               "schema": {
+                                  "properties": {
+                                     "genkey": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "description": "A unique key used to identify this generation while it is in progress."
+                                     }
+                                  },
+                                  "required": [
+                                     "genkey"
+                                  ],
+                                  "type": "object"
+                               }
+                            }
+                         },
+                         "required": true
+                      },
+                      "responses": {
+                         "200": {
+                            "content": {
+                               "application/json": {
+                                  "example": {
+                                     "found": true,
+                                     "batched": true,
+                                     "state": 2,
+                                     "slot": 1,
+                                     "queue_position": -1,
+                                     "prompt_tokens": 100,
+                                     "completion_tokens": 12,
+                                     "max_length": 80,
+                                     "init_seconds": 0.01,
+                                     "process_seconds": 0.2,
+                                     "generation_seconds": 0.5,
+                                     "elapsed_seconds": 0.71,
+                                     "finish_reason": -1,
+                                     "finished": false
+                                  },
+                                  "schema": {
+                                     "$ref": "#/components/schemas/GenerationStats"
+                                  }
+                               }
+                            },
+                            "description": "Successful request"
+                         }
+                      },
+                      "summary": "Poll the token counts and timings of the currently ongoing text generation.",
                       "tags": [
                          "api/extra"
                       ]

@@ -138,6 +138,9 @@ punishcounter = 0 #causes a timeout if too many errors
 rewardcounter = 0 #reduces error counts for successful jobs
 totalgens = 0
 currentusergenkey = "" #store a special key so polled streaming works even in multiuser
+currentusergenkey_batched = False #true if the current genkey is a batched request, which has its own counters
+currentusergenkey_serial = 0 #the library's generation serial when the current genkey was set; the generation has started once it moves
+batch_request_ids_by_genkey = {} #genkey -> batch request id, while the request exists
 pendingabortkey = "" #if an abort is received for the non-active request, remember it (at least 1) to cancel later
 args = None #global args
 runmode_untouched = True
@@ -425,6 +428,21 @@ class generation_outputs(ctypes.Structure):
                 ("prompt_tokens", ctypes.c_int),
                 ("completion_tokens", ctypes.c_int),
                 ("text", ctypes.c_char_p)]
+
+class generation_stats_outputs(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_int),
+                ("state", ctypes.c_int),
+                ("slot", ctypes.c_int),
+                ("queue_position", ctypes.c_int),
+                ("prompt_tokens", ctypes.c_int),
+                ("completion_tokens", ctypes.c_int),
+                ("max_length", ctypes.c_int),
+                ("init_seconds", ctypes.c_float),
+                ("process_seconds", ctypes.c_float),
+                ("generation_seconds", ctypes.c_float),
+                ("elapsed_seconds", ctypes.c_float),
+                ("finish_reason", ctypes.c_int),
+                ("finished", ctypes.c_int)]
 
 class sd_load_model_inputs(ctypes.Structure):
     _fields_ = [("model_filename", ctypes.c_char_p),
@@ -1013,6 +1031,11 @@ def init_library():
     handle.batch_generate_abort.restype = ctypes.c_bool
     handle.batch_generate_release.argtypes = [ctypes.c_int]
     handle.batch_generate_release.restype = None
+    handle.batch_generate_stats.argtypes = [ctypes.c_int]
+    handle.batch_generate_stats.restype = generation_stats_outputs
+    handle.generate_stats.argtypes = [ctypes.c_int]
+    handle.generate_stats.restype = generation_stats_outputs
+    handle.get_generation_serial.restype = ctypes.c_int
     handle.has_audio_support.restype = ctypes.c_bool
     handle.has_vision_support.restype = ctypes.c_bool
     handle.get_last_eval_time.restype = ctypes.c_float
@@ -2199,7 +2222,7 @@ def coerce_ban_list(value):
     return [value]
 
 def generate(genparams, stream_flag=False):
-    global maxctx, args, currentusergenkey, totalgens, pendingabortkey
+    global maxctx, args, currentusergenkey, currentusergenkey_batched, currentusergenkey_serial, totalgens, pendingabortkey
     default_adapter = {} if chatcompl_adapter is None else chatcompl_adapter
     adapter_obj = genparams.get('adapter', default_adapter)
 
@@ -2437,6 +2460,7 @@ def generate(genparams, stream_flag=False):
     inputs.reasoning_budget = reasoning_budget
 
     currentusergenkey = genkey
+    currentusergenkey_serial = handle.get_generation_serial()
     totalgens += 1
     #early exit if aborted
 
@@ -2451,8 +2475,11 @@ def generate(genparams, stream_flag=False):
                 batch_request_id = handle.batch_generate_submit(inputs)
             except Exception:
                 batch_request_id = -1
+        currentusergenkey_batched = batch_request_id >= 0
         if batch_request_id >= 0:
             genparams['_batch_request_id'] = batch_request_id
+            if genkey:
+                batch_request_ids_by_genkey[genkey] = batch_request_id
             ret = handle.batch_generate_result(batch_request_id)
         else:
             genparams['_batch_fallback'] = True
@@ -2463,6 +2490,8 @@ def generate(genparams, stream_flag=False):
         if batch_request_id >= 0 and not stream_flag:
             handle.batch_generate_release(batch_request_id)
             genparams.pop('_batch_request_id', None)
+            if genkey:
+                batch_request_ids_by_genkey.pop(genkey, None)
             genparams.pop('_batch_expected', None)
             genparams.pop('_batch_fallback', None)
         if trimstop:
@@ -6270,6 +6299,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             if batch_request_id >= 0:
                 handle.batch_generate_release(batch_request_id)
                 genparams.pop('_batch_request_id', None)
+                batch_request_ids_by_genkey.pop(genparams.get('genkey', ""), None)
             genparams.pop('_batch_expected', None)
             genparams.pop('_batch_fallback', None)
 
@@ -7118,6 +7148,39 @@ Change Mode<br>
                 response_body = (json.dumps({"success": "true", "done":"false"}).encode())
             else:
                 response_body = (json.dumps({"success": "false", "done":"false"}).encode())
+
+        elif clean_path.endswith('/api/extra/generate/stats'):
+            if not self.secure_endpoint():
+                return
+            statskey = ""
+            try:
+                tempbody = json.loads(body)
+                if isinstance(tempbody, dict):
+                    statskey = tempbody.get('genkey', "")
+            except Exception:
+                statskey = ""
+            if not isinstance(statskey, str):
+                statskey = ""
+            bs = None
+            batched = False
+            brid = batch_request_ids_by_genkey.get(statskey, -1) if statskey else -1
+            if brid >= 0:
+                batched = True
+                bs = handle.batch_generate_stats(brid)
+                if bs.status != 1:
+                    bs = None
+            elif totalgens > 0 and not currentusergenkey_batched and ((statskey=="" and statskey==currentusergenkey and requestsinqueue==0) or (statskey!="" and statskey==currentusergenkey)):
+                #same key rule as check, but batched requests never read these shared counters
+                bs = handle.generate_stats(currentusergenkey_serial)
+            if bs is None:
+                stats = {"found": False}
+            else:
+                stats = {"found": True, "batched": batched}
+                for field_name, _ in generation_stats_outputs._fields_:
+                    if field_name != "status":
+                        stats[field_name] = getattr(bs, field_name)
+                stats["finished"] = bool(stats["finished"])
+            response_body = (json.dumps(stats).encode())
 
         elif clean_path.endswith('/api/extra/generate/check'):
             if not self.secure_endpoint():
