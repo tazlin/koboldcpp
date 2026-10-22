@@ -11574,6 +11574,7 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         else:
             choices = [tool_choice]
         prompt_tokens = 0
+        has_memory = False
         for choice in choices:
             estimate_payload = copy.deepcopy(payload)
             estimate_payload['tool_choice'] = choice
@@ -11582,11 +11583,14 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
             render_tokens = len(tokenize_ids(rendered.get('prompt', ""), True))
             if rendered.get('memory', ""): #the engine tokenizes memory apart from the prompt and reserves one more token beside it
                 render_tokens += len(tokenize_ids(rendered['memory'], True)) + 1
+                has_memory = True
             prompt_tokens = max(prompt_tokens, render_tokens)
         ctxlimit = tryparseint(payload.get('max_context_length', horde_ctxlimit), horde_ctxlimit)
         genlimit = tryparseint(payload.get('max_length', args.defaultgenamt), args.defaultgenamt)
         exceeds_horde_limits = ctxlimit > horde_chat_limits["max_context_length"] or genlimit > horde_chat_limits["max_length"]
-        return exceeds_horde_limits or prompt_tokens + genlimit > ctxlimit, prompt_tokens
+        # has_memory selects the engine's trim bound for the check after generation; when any render carries memory
+        # the lower bound applies, which faults rather than submits a reply near the limit
+        return exceeds_horde_limits or prompt_tokens + genlimit > ctxlimit, prompt_tokens, has_memory
 
     def horde_generic_tools():
         # a jinja template renders tools without a grammar and its calls are parsed afterwards, so only the generic
@@ -11601,6 +11605,51 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         if (tool_choice == "required" or forced_name) and not tool_calls:
             return True
         return payload.get('parallel_tool_calls', True) is False and len(tool_calls) > 1
+
+    def horde_chat_image_prompt_trimmed(payload, processed_prompt_tokens, has_memory):
+        # the prompt estimate cannot count image tokens, so a job with images is checked after generation against
+        # the count the engine processed. AppendDedicatedMemoryAndNegativePrompt in gpttype_adapter.cpp trims to
+        # max_context_length - max_length - 1 tokens when memory is rendered (memory plus one reserved token plus the
+        # prompt), and to max_context_length - max_length when it is not. A count at the bound means text was
+        # trimmed or fit exactly; both are treated as trimmed.
+        has_images = any(isinstance(item, dict) and item.get("type") == "image_url"
+                         for message in payload.get("messages", []) if isinstance(message.get("content"), list)
+                         for item in message["content"])
+        if not has_images or processed_prompt_tokens is None:
+            return False
+        ctxlimit = tryparseint(payload.get('max_context_length', horde_ctxlimit), horde_ctxlimit)
+        genlimit = tryparseint(payload.get('max_length', args.defaultgenamt), args.defaultgenamt)
+        return processed_prompt_tokens >= ctxlimit - genlimit - (1 if has_memory else 0)
+
+    def horde_chat_fetch_images(payload):
+        # horde chat jobs reference images by signed url, but the local chat endpoint only reads data urls
+        for message in payload.get("messages", []):
+            content = message.get("content", None)
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "image_url":
+                    continue
+                url = (item.get("image_url") or {}).get("url", "")
+                if not url.startswith(("http://", "https://")):
+                    continue
+                maxbytes = 16 * 1024 * 1024 #images above this size are refused rather than read into memory
+                request = urllib.request.Request(url, headers={'User-Agent':'KoboldCppEmbeddedWorkerV2'})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    mimetype = response.headers.get('Content-Type', '').split(";")[0].strip()
+                    imgdata = response.read(maxbytes + 1)
+                if len(imgdata) > maxbytes:
+                    raise ValueError(f"image exceeds {maxbytes} bytes")
+                # the stored copy's bytes decide the media type; a store may answer with a generic content type
+                if imgdata.startswith(b"\x89PNG"):
+                    mimetype = "image/png"
+                elif imgdata.startswith(b"\xff\xd8"):
+                    mimetype = "image/jpeg"
+                elif imgdata[:4] == b"RIFF" and imgdata[8:12] == b"WEBP":
+                    mimetype = "image/webp"
+                elif not mimetype.startswith("image/"):
+                    mimetype = "image/jpeg"
+                item["image_url"]["url"] = f"data:{mimetype};base64,{base64.b64encode(imgdata).decode('ascii')}"
 
     while exitcounter < 10:
         time.sleep(3)
@@ -11653,11 +11702,15 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         if args.hordechat:
             gen_dict["chat_jobs"] = True
             gen_dict["chat_features"] = ["seed", "presence_penalty", "tools", "json_object", "json_schema"] #frequency_penalty is only an alias for presence_penalty here
+            if has_vision_support:
+                gen_dict["chat_features"].append("vision")
+                gen_dict["image_transports"] = ["url", "base64"]
             # guarantees: a horde job faults when its response_format grammar cannot be built, and the horde verifies
             # strict json_schema replies and refuses violating ones, which the submit faults
             gen_dict["chat_features"].append("structured_output_enforced")
             if horde_generic_tools():
                 gen_dict["chat_features"] += ["tool_choice_enforced", "single_tool_call_enforced"]
+            # text prompts are bounded before generation and prompts with images are checked after it
             gen_dict["chat_features"].append("prompt_overflow_refused")
             gen_dict["chat_limits"] = dict(horde_chat_limits)
             gen_dict["model_id"] = friendlymodelname
@@ -11679,6 +11732,7 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         current_id = pop['id']
         current_payload = pop['payload']
         is_chat_job = bool(pop.get('chat', False))
+        chat_has_memory = False
         # a faulted chat submit carries a fault_reason from the horde's fixed vocabulary; a horde that does not
         # know the field ignores it
         chat_fault_reason = "generation_error"
@@ -11687,7 +11741,18 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
 
         if is_chat_job:
             try:
-                overflowed, chat_prompt_tokens = horde_chat_overflows(current_payload)
+                horde_chat_fetch_images(current_payload)
+            except Exception as e:
+                # a failed input fetch is not a generation error, and no fault_reason describes it
+                print_with_time(f"Worker {worker_id} - Chat job {current_id} image could not be fetched, faulting it: {e}")
+                submit_dict = {"id": current_id, "state": "faulted", "model_id": friendlymodelname}
+                submit_thread = threading.Thread(target=submit_completed_generation, args=(cluster + '/api/v2/generate/text/submit', current_id, session_starttime, submit_dict))
+                submit_thread.start()
+                current_id = None
+                current_payload = None
+                continue
+            try:
+                overflowed, chat_prompt_tokens, chat_has_memory = horde_chat_overflows(current_payload)
                 render_fault_reason = "prompt_overflow"
             except Exception as e:
                 print_with_time(f"Worker {worker_id} - Chat job {current_id} could not be rendered, faulting it: {e}")
@@ -11727,6 +11792,10 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
             print_with_time(f"Worker {worker_id} - Chat job {current_id} reply does not satisfy its tool_choice or parallel_tool_calls.")
             current_generation = None #faulted below, as the declared guarantees require
             chat_fault_reason = "tool_violation"
+        if current_generation and is_chat_job and horde_chat_image_prompt_trimmed(current_payload, (current_generation.get("usage") or {}).get("prompt_tokens"), chat_has_memory):
+            print_with_time(f"Worker {worker_id} - Chat job {current_id} prompt with images reached the context limit and may have been trimmed.")
+            current_generation = None #faulted below, as prompt_overflow_refused requires
+            chat_fault_reason = "prompt_overflow"
         if current_generation and is_chat_job:
             chat_choice = current_generation["choices"][0]
             chat_usage = current_generation.get("usage", {})
