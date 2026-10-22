@@ -11651,6 +11651,24 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
                     mimetype = "image/jpeg"
                 item["image_url"]["url"] = f"data:{mimetype};base64,{base64.b64encode(imgdata).decode('ascii')}"
 
+    def horde_chat_fetch_messages(payload):
+        # a horde offloads a large request's messages to one signed url, which expires 120 seconds after the pop
+        url = payload.pop("messages_url", None)
+        if not url or "messages" in payload:
+            return
+        maxbytes = 36 * 1024 * 1024 #the horde's chat request body cap, which bounds every messages object it stores
+        request = urllib.request.Request(url, headers={'User-Agent':'KoboldCppEmbeddedWorkerV2'})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            # urllib does not decode a content encoding, and the store may serve the object gzipped or plain
+            gzipped = response.headers.get('Content-Encoding', '').strip().lower() == "gzip"
+            body = (gzip.GzipFile(fileobj=response) if gzipped else response).read(maxbytes + 1)
+        if len(body) > maxbytes:
+            raise ValueError(f"messages exceed {maxbytes} bytes")
+        messages = json.loads(body.decode('utf-8'))
+        if not isinstance(messages, list):
+            raise ValueError("messages are not a list")
+        payload["messages"] = messages
+
     while exitcounter < 10:
         time.sleep(3)
         readygo = make_url_request_horde(f'{epurl}/api/v1/info/version', None,'GET',addmykey=True)
@@ -11702,9 +11720,11 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         if args.hordechat:
             gen_dict["chat_jobs"] = True
             gen_dict["chat_features"] = ["seed", "presence_penalty", "tools", "json_object", "json_schema"] #frequency_penalty is only an alias for presence_penalty here
+            # messages_url delivers an offloaded messages array to any chat worker; url and base64 deliver image parts
+            gen_dict["image_transports"] = ["messages_url"]
             if has_vision_support:
                 gen_dict["chat_features"].append("vision")
-                gen_dict["image_transports"] = ["url", "base64"]
+                gen_dict["image_transports"] = ["url", "base64", "messages_url"]
             # guarantees: a horde job faults when its response_format grammar cannot be built, and the horde verifies
             # strict json_schema replies and refuses violating ones, which the submit faults
             gen_dict["chat_features"].append("structured_output_enforced")
@@ -11740,6 +11760,17 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         print_with_time(f"Job {current_id} received from {cluster} for {current_payload.get('max_length',0)} tokens and {current_payload.get('max_context_length',0)} max context. Starting generation...")
 
         if is_chat_job:
+            try:
+                horde_chat_fetch_messages(current_payload)
+            except Exception as e:
+                # no fault_reason describes a failed input fetch
+                print_with_time(f"Worker {worker_id} - Chat job {current_id} messages could not be fetched, faulting it: {e}")
+                submit_dict = {"id": current_id, "state": "faulted", "model_id": friendlymodelname}
+                submit_thread = threading.Thread(target=submit_completed_generation, args=(cluster + '/api/v2/generate/text/submit', current_id, session_starttime, submit_dict))
+                submit_thread.start()
+                current_id = None
+                current_payload = None
+                continue
             try:
                 horde_chat_fetch_images(current_payload)
             except Exception as e:
