@@ -11451,7 +11451,7 @@ def print_with_time(txt):
     print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt, flush=True)
 
 def make_url_request(url, data, method='POST', headers={}, timeout=600, error_info=None):
-    #error_info, when given, receives the http status and the json body's return code of a refused request
+    #error_info, when given, receives the http status, the json body and its return code of a refused request
     global nocertify
     try:
         request = None
@@ -11484,13 +11484,169 @@ def make_url_request(url, data, method='POST', headers={}, timeout=600, error_in
             print_with_time(f"Error: {e}")
         if error_info is not None:
             try:
-                error_info["rc"] = json.loads(errmsg).get("rc")
+                error_info["body"] = json.loads(errmsg)
+                error_info["rc"] = error_info["body"].get("rc")
             except Exception:
                 pass
         return None
     except Exception as e:
         print_with_time(f"Error: {e} - {response_data}")
         return None
+
+def make_url_stream_request(url, data, headers={}, timeout=600, on_event=None):
+    #posts data and passes the json of each server-sent event to on_event. Returns True once the stream reaches
+    #[DONE], the json body when the endpoint answers without a stream, and None on any failure
+    try:
+        json_payload = json.dumps(data).encode('utf-8')
+        request = urllib.request.Request(url, data=json_payload, headers=headers, method='POST')
+        request.add_header('content-type', 'application/json')
+        with urllib.request.urlopen(request,timeout=timeout) as response:
+            if 'text/event-stream' not in response.headers.get('Content-Type', ''):
+                return json.loads(response.read().decode('utf-8',"ignore"))
+            datalines = []
+            for rawline in response:
+                line = rawline.decode('utf-8',"ignore").rstrip("\r\n")
+                if line.startswith("data:"):
+                    datalines.append(line[6:] if line.startswith("data: ") else line[5:])
+                elif line == "" and datalines: #a blank line ends an event; comment lines are keepalives
+                    eventdata = "\n".join(datalines)
+                    datalines = []
+                    if eventdata.strip() == "[DONE]":
+                        return True
+                    if on_event is not None:
+                        on_event(json.loads(eventdata))
+        print_with_time(f"Error: stream from {url} ended before [DONE]")
+        return None
+    except urllib.error.HTTPError as e:
+        try:
+            print_with_time(f"Error: {e} - {e.read().decode('utf-8','ignore')}")
+        except Exception:
+            print_with_time(f"Error: {e}")
+        return None
+    except Exception as e:
+        print_with_time(f"Error: {e}")
+        return None
+
+class HordeChatStreamReply:
+    #rebuilds a streamed chat completion in the shape the blocking endpoint returns, so the horde worker submits and
+    #checks the same reply either way. Tool calls arrive whole at the end of the stream, after any content.
+    def __init__(self):
+        self.content = "" #rebound on each delta, so another thread reads a consistent prefix without a lock
+        self.tool_calls = {}
+        self.finish_reason = None
+        self.usage = None
+        self.failed = False
+
+    def add_event(self, event):
+        if not isinstance(event, dict) or event.get("error"):
+            self.failed = True #the endpoint reports a failed generation as an error event inside the stream
+            return
+        if isinstance(event.get("usage"), dict):
+            self.usage = event["usage"]
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                self.content += delta["content"]
+            for call in delta.get("tool_calls") or []:
+                # a call's first delta carries its id and name and the following ones its arguments
+                entry = self.tool_calls.setdefault(call.get("index", len(self.tool_calls)), {"type": "function", "function": {"name": "", "arguments": ""}})
+                function = call.get("function") or {}
+                if function.get("name"):
+                    entry["function"]["name"] = function["name"]
+                if function.get("arguments"):
+                    entry["function"]["arguments"] += function["arguments"]
+                if call.get("id"):
+                    entry["id"] = call["id"]
+            if choice.get("finish_reason") is not None:
+                self.finish_reason = choice["finish_reason"]
+
+    def result(self):
+        if self.failed or self.finish_reason is None:
+            return None
+        tool_calls = [self.tool_calls[index] for index in sorted(self.tool_calls)]
+        message = {"role": "assistant", "content": self.content, "tool_calls": tool_calls}
+        return {"choices": [{"index": 0, "message": message, "finish_reason": self.finish_reason}], "usage": self.usage or {}}
+
+class HordeChatProgressPoster:
+    #posts the text of a streamed horde chat job while it generates. post(body) returns the http status and json
+    #body of the answer, with no status when the request did not reach the horde.
+    interval = 1.0 #one post a second per streamed job bounds the request rate a worker adds to the horde
+    max_failures = 3 #consecutive failed posts after which the job stops posting and only submits
+
+    def __init__(self, post, jobid, get_content, on_cancelled=None):
+        self.post = post
+        self.jobid = jobid
+        self.get_content = get_content
+        self.on_cancelled = on_cancelled #stops the local generation when the horde reports the request cancelled
+        self.horde_cancelled = False #the horde settled the job on the text it accepted, so it is not submitted
+        self.seq = 1 #seq of the next post
+        self.accepted_len = 0 #characters of the content the horde has accepted
+        self.pending = None #an unanswered post, resent unchanged so the horde answers a retry as the original
+        self.failures = 0
+        self.stopped = False
+        self.sent = False
+        self.ended = threading.Event()
+        self.cancelled = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def finish(self):
+        #returns once the remaining text is posted or posting stopped, so the job's posts end before its submit
+        self.ended.set()
+        self.thread.join()
+
+    def cancel(self):
+        self.stopped = True
+        self.cancelled.set()
+        self.ended.set()
+        self.thread.join()
+
+    def post_once(self):
+        #returns True when the post failed and is retried after an interval
+        if self.pending is None:
+            content = self.get_content()
+            if len(content) <= self.accepted_len:
+                return False
+            self.pending = {"id": self.jobid, "seq": self.seq, "delta": {"content": content[self.accepted_len:]}}
+        self.sent = True
+        status, body = self.post(self.pending)
+        body = body if isinstance(body, dict) else {}
+        expected_seq = body.get("expected_seq") if status == 409 else None
+        # every retry is identical, so a 409 expecting the next seq means this post was accepted and its answer lost
+        if status == 200 or expected_seq == self.pending["seq"] + 1:
+            self.accepted_len += len(self.pending["delta"]["content"])
+            self.seq = self.pending["seq"] + 1
+            self.pending = None
+            self.failures = 0
+            if status == 200 and body.get("cancelled") is True:
+                self.horde_cancelled = True
+                self.stopped = True
+                if self.on_cancelled is not None:
+                    self.on_cancelled()
+            return False
+        if status in (403, 404, 413) or (status == 409 and not (isinstance(expected_seq, int) and 1 <= expected_seq <= self.pending["seq"])):
+            self.stopped = True #the job has no lease, reached its cap, or the horde holds text this worker cannot account for
+            return False
+        self.failures += 1
+        if status == 409:
+            # the horde has not accepted this post; the next one carries every character it has not accepted
+            self.seq = expected_seq
+            self.pending = None
+        if self.failures >= self.max_failures:
+            self.stopped = True
+            return False
+        return True
+
+    def run(self):
+        while not self.stopped and not self.ended.wait(self.interval):
+            self.post_once()
+        while not self.stopped and not self.cancelled.is_set():
+            if self.post_once():
+                self.cancelled.wait(self.interval)
+            elif self.pending is None and len(self.get_content()) <= self.accepted_len:
+                break
 
 #A very simple and stripped down embedded horde worker with no dependencies
 def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_threads):
@@ -11533,12 +11689,15 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
                 if exitcounter > 1:
                     exitcounter -= 1
 
-    def make_url_request_horde(url, data, method='POST',addmykey=False,error_info=None):
+    def horde_headers(addmykey=False):
         global password
-        headers = headers = {"apikey": api_key,'User-Agent':'KoboldCppEmbeddedWorkerV2','Client-Agent':'KoboldCppEmbedWorker:2'}
+        headers = {"apikey": api_key,'User-Agent':'KoboldCppEmbeddedWorkerV2','Client-Agent':'KoboldCppEmbedWorker:2'}
         if addmykey and password!="":
             headers["Authorization"] = f"Bearer {password}"
-        ret = make_url_request(url, data, method, headers, error_info=error_info)
+        return headers
+
+    def make_url_request_horde(url, data, method='POST',addmykey=False,error_info=None):
+        ret = make_url_request(url, data, method, horde_headers(addmykey), error_info=error_info)
         if not ret:
             print(f"Worker {worker_id} - Make sure your Horde API key and worker name is valid!")
         return ret
@@ -11668,6 +11827,39 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         if not isinstance(messages, list):
             raise ValueError("messages are not a list")
         payload["messages"] = messages
+
+    def post_horde_chat_progress(body):
+        error_info = {}
+        # a stalled post holds back the posts after it, and the submit waits for the last one
+        reply = make_url_request(f'{cluster}/api/v2/generate/text/progress', body, 'POST', horde_headers(), timeout=10, error_info=error_info)
+        if reply is not None:
+            return 200, reply
+        return error_info.get("status"), error_info.get("body")
+
+    def horde_chat_generate(genurl, payload, jobid):
+        # the job streams from the local endpoint so its text can be posted to the horde while it generates.
+        # Returns the reply in the blocking endpoint's shape, or None, whether any progress was posted, and whether
+        # the horde reported the request cancelled.
+        if payload.get("tools"):
+            # a streamed tool reply can differ from the blocking one: a jinja template streams its prose before the
+            # call tag and drops a call the parser finds without that tag, so tool jobs keep the blocking request
+            return make_url_request_horde(genurl, payload, method='POST', addmykey=True), False, False
+        reply = HordeChatStreamReply()
+        poster = None
+        if payload.get("stream_progress") is True:
+            abort_local = lambda: make_url_request(f'{epurl}/api/extra/abort', {"genkey": payload.get("genkey", "")}, 'POST', horde_headers(True), timeout=10)
+            poster = HordeChatProgressPoster(post_horde_chat_progress, jobid, lambda: reply.content, on_cancelled=abort_local)
+            poster.start()
+        stream_payload = dict(payload, stream=True, stream_options={"include_usage": True})
+        streamed = make_url_stream_request(genurl, stream_payload, horde_headers(True), on_event=reply.add_event)
+        generation = streamed if isinstance(streamed, dict) else (reply.result() if streamed else None)
+        if poster is None:
+            return generation, False, False
+        if generation:
+            poster.finish()
+        else:
+            poster.cancel()
+        return generation, poster.sent, poster.horde_cancelled
 
     while exitcounter < 10:
         time.sleep(3)
@@ -11800,17 +11992,24 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
                 continue
 
         #do gen
+        chat_cancelled = False
         while exitcounter < 10:
             if parallel_batching_threads>1 or not modelbusy.locked():
                 #horde gets a genkey to avoid KCPP overlap
                 current_payload['genkey'] = f"HORDEREQ_{random.randint(100, 999)}"
                 genurl = f'{epurl}/v1/chat/completions' if is_chat_job else f'{epurl}/api/v1/generate'
-                current_generation = make_url_request_horde(genurl, current_payload, method='POST',addmykey=True)
-                if current_generation:
+                chat_progress_sent = False
+                chat_cancelled = False
+                if is_chat_job:
+                    current_generation, chat_progress_sent, chat_cancelled = horde_chat_generate(genurl, current_payload, current_id)
+                else:
+                    current_generation = make_url_request_horde(genurl, current_payload, method='POST',addmykey=True)
+                if current_generation or chat_cancelled:
                     break
                 else:
                     currentjob_attempts += 1
-                    if currentjob_attempts>5:
+                    # a retry generates another reply, which would not continue the text already posted as progress
+                    if currentjob_attempts>5 or chat_progress_sent:
                         break
 
             print_with_time(f"Worker {worker_id} - Server Busy - Not ready to generate...")
@@ -11827,7 +12026,10 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
             print_with_time(f"Worker {worker_id} - Chat job {current_id} prompt with images reached the context limit and may have been trimmed.")
             current_generation = None #faulted below, as prompt_overflow_refused requires
             chat_fault_reason = "prompt_overflow"
-        if current_generation and is_chat_job:
+        if is_chat_job and chat_cancelled:
+            # the horde already settled the job on the text it accepted and refuses a submit for it
+            print_with_time(f"Worker {worker_id} - Chat job {current_id} was cancelled by the horde, not submitting it.")
+        elif current_generation and is_chat_job:
             chat_choice = current_generation["choices"][0]
             chat_usage = current_generation.get("usage", {})
             chat_tool_calls = chat_choice["message"].get("tool_calls") or []
