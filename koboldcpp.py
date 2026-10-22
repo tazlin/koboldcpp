@@ -11528,7 +11528,7 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
     exitcounter = 0
     print(f"===\nEmbedded Horde Worker '{worker_name}' Starting...\n(To use your own Horde Bridge/Scribe worker instead, don't set your API key)\n")
     BRIDGE_AGENT = "KoboldCppEmbedWorker:2:https://github.com/LostRuins/koboldcpp"
-    cluster = "https://aihorde.net"
+    cluster = args.hordeurl.rstrip('/')
     while exitcounter < 10:
         time.sleep(3)
         readygo = make_url_request_horde(f'{epurl}/api/v1/info/version', None,'GET',addmykey=True)
@@ -14126,6 +14126,7 @@ if __name__ == '__main__':
     hordeparsergroup.add_argument("--hordekey", metavar=('[apikey]'), help="Sets your AI Horde API key.", default="")
     hordeparsergroup.add_argument("--hordemaxctx", metavar=('[amount]'), help="Sets the maximum context length your worker will accept from an AI Horde job. If 0, matches main context limit.", type=int, default=0)
     hordeparsergroup.add_argument("--hordegenlen", metavar=('[amount]'), help="Sets the maximum number of tokens your worker will generate from an AI horde job.", type=int, default=0)
+    hordeparsergroup.add_argument("--hordeurl", metavar=('[url]'), help="Sets the AI Horde cluster your worker pops jobs from and submits them to.", default="https://aihorde.net")
 
     sdparsergroup = parser.add_argument_group('Image Generation Commands')
     sdparsergroup.add_argument("--sdaudiovae", metavar=('[filename]'), help="Specify an image generation audio VAE for LTX2.3 video generation.", default="")
