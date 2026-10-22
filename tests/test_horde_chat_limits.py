@@ -81,7 +81,7 @@ class HordeChatLimitsTests(unittest.TestCase):
 
     def test_advertisement_respects_operator_context_and_generation_limits(self):
         declaration, _ = self.capture_worker(32768, 4096, 256)
-        self.assertEqual(declaration["chat_limits"], {"max_context_length": 4096, "max_length": 256})
+        self.assertEqual(declaration["chat_limits"], {"max_context_length": 4096, "max_length": 256, "tools_max_temperature": koboldcpp.tools_max_temperature})
         self.assertEqual(declaration["max_context_length"], 4096)
         self.assertEqual(declaration["max_length"], 256)
 
@@ -89,7 +89,7 @@ class HordeChatLimitsTests(unittest.TestCase):
         for horde_ctx in (0, 8192):
             with self.subTest(horde_ctx=horde_ctx):
                 declaration, _ = self.capture_worker(4096, horde_ctx, 10000)
-                self.assertEqual(declaration["chat_limits"], {"max_context_length": 4096, "max_length": 3277})
+                self.assertEqual(declaration["chat_limits"], {"max_context_length": 4096, "max_length": 3277, "tools_max_temperature": koboldcpp.tools_max_temperature})
 
     def test_chat_jobs_exceeding_either_declared_limit_fault_before_generation(self):
         for context, generation in ((8192, 64), (4096, 257)):

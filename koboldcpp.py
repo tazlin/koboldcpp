@@ -4940,6 +4940,12 @@ def apply_forced_sysprompt(genparams, api_format):
     return genparams
 
 
+class HordeGrammarError(ValueError):
+    # raised for a horde job whose response_format or tool call grammar cannot be built, so the worker can report
+    # that fault apart from other render failures
+    pass
+
+
 def transform_genparams(genparams, api_format, use_jinja):
     global chatcompl_adapter, maxctx, thinkformats, cached_jinja_kwargs
 
@@ -5046,6 +5052,10 @@ ws ::= | " " | "\n" [ \t]{0,20}
             latest_turn_was_assistant = False
             latest_turn_was_tool = False
 
+            # horde chat jobs are routed by the fidelity the worker declares, so where a local request falls back
+            # to unconstrained output a horde job raises instead and the worker faults it
+            is_horde_job = str(genparams.get('genkey', '')).startswith('HORDEREQ_')
+
             # handle structured outputs
             respformat = genparams.get('response_format', None)
             if respformat:
@@ -5064,6 +5074,8 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     # In case of any issues, just do normal gen
                     print("Structured Output not valid - discarded")
                     pass
+                if is_horde_job and not respformat_grammar and str(respformat.get('type', '') if isinstance(respformat, dict) else '').lower() in ("json_schema", "json_object"):
+                    raise HordeGrammarError("the response_format schema could not be converted to a grammar")
             elif 'json_schema' in genparams:
                 try:
                     schema = genparams.get('json_schema')
@@ -5224,6 +5236,8 @@ ws ::= | " " | "\n" [ \t]{0,20}
                                     genparams["grammar"] = decoded
                             except Exception:
                                 pass
+                            if is_horde_job and genparams["grammar"] == jsongrammar:
+                                raise HordeGrammarError(f"the call grammar for tool {toolname} could not be built")
                             tool_json_formatting_instruction = f"\nPlease use the provided schema to fill the parameters to create a function call for {toolname}, in the following format: " + json.dumps([{"id": "call_001", "type": "function", "function": {"name": f"{toolname}", "arguments": {"first property key": "first property value", "second property key": "second property value"}}}], indent=0)
                             messages_string += f"\n\nJSON Schema:\n{used_tool_json}\n\n{tool_json_formatting_instruction}{assistant_message_start}"
 
@@ -11543,18 +11557,50 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
     horde_chat_limits = {
         "max_context_length": horde_ctxlimit,
         "max_length": min(maxhordelen, horde_ctxlimit - calculate_min_remain_hardlimit(horde_ctxlimit, 0)),
+        "tools_max_temperature": tools_max_temperature,
     }
 
     def horde_chat_overflows(payload):
-        # the engine silently drops the oldest context to fit, but a chat job must be refused instead
-        rendered = transform_genparams(copy.deepcopy(payload), 4, args.jinja)
-        prompt_tokens = len(tokenize_ids(rendered.get('prompt', ""), True))
-        if rendered.get('memory', ""): #the engine tokenizes memory apart from the prompt and reserves one more token beside it
-            prompt_tokens += len(tokenize_ids(rendered['memory'], True)) + 1
+        # the engine silently drops the oldest context to fit, but a chat job must be refused instead.
+        # Under auto and required the transform's tool selection generates in-process, so the estimate renders a
+        # forced call to each offered tool instead. A forced render is the no-call prompt plus the call schema, so the
+        # largest one bounds the prompt the reply is generated from. The forced choice has no "type", so
+        # filter_tools_for_tool_choice keeps the full tool list the real run renders, while
+        # extract_tool_info_from_tool_array still selects the function by name.
+        tool_choice = payload.get('tool_choice', 'auto')
+        tool_names = extract_all_names_from_tool_array(normalize_openai_tools_input(payload.get('tools') or []))
+        if tool_names and isinstance(tool_choice, str) and tool_choice.lower() != "none":
+            choices = [{"function": {"name": name}} for name in tool_names]
+        else:
+            choices = [tool_choice]
+        prompt_tokens = 0
+        for choice in choices:
+            estimate_payload = copy.deepcopy(payload)
+            estimate_payload['tool_choice'] = choice
+            estimate_payload['genkey'] = "HORDEREQ_estimate" #renders as a horde job, which raises when a grammar the job needs cannot be built
+            rendered = transform_genparams(estimate_payload, 4, args.jinja)
+            render_tokens = len(tokenize_ids(rendered.get('prompt', ""), True))
+            if rendered.get('memory', ""): #the engine tokenizes memory apart from the prompt and reserves one more token beside it
+                render_tokens += len(tokenize_ids(rendered['memory'], True)) + 1
+            prompt_tokens = max(prompt_tokens, render_tokens)
         ctxlimit = tryparseint(payload.get('max_context_length', horde_ctxlimit), horde_ctxlimit)
         genlimit = tryparseint(payload.get('max_length', args.defaultgenamt), args.defaultgenamt)
         exceeds_horde_limits = ctxlimit > horde_chat_limits["max_context_length"] or genlimit > horde_chat_limits["max_length"]
         return exceeds_horde_limits or prompt_tokens + genlimit > ctxlimit, prompt_tokens
+
+    def horde_generic_tools():
+        # a jinja template renders tools without a grammar and its calls are parsed afterwards, so only the generic
+        # path's selection and call grammar bound which and how many tools a reply calls
+        return not (args.jinja and cached_chat_template)
+
+    def horde_chat_tool_violation(payload, tool_calls):
+        # the call grammar does not cover a reply cut off by its length limit or an unparsed tool selection,
+        # either of which leaves prose where tool_choice demands a call
+        tool_choice = payload.get('tool_choice', 'auto') if payload.get('tools') else "none"
+        forced_name = (tool_choice.get('function') or {}).get('name') if isinstance(tool_choice, dict) else None
+        if (tool_choice == "required" or forced_name) and not tool_calls:
+            return True
+        return payload.get('parallel_tool_calls', True) is False and len(tool_calls) > 1
 
     while exitcounter < 10:
         time.sleep(3)
@@ -11606,7 +11652,12 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
             gen_dict["threads"] = parallel_batching_threads
         if args.hordechat:
             gen_dict["chat_jobs"] = True
-            gen_dict["chat_features"] = ["seed", "presence_penalty"] #frequency_penalty is only an alias for presence_penalty here
+            gen_dict["chat_features"] = ["seed", "presence_penalty", "tools", "json_object", "json_schema"] #frequency_penalty is only an alias for presence_penalty here
+            # guarantees: a horde job faults when its response_format grammar cannot be built, and the horde verifies
+            # strict json_schema replies and refuses violating ones, which the submit faults
+            gen_dict["chat_features"].append("structured_output_enforced")
+            if horde_generic_tools():
+                gen_dict["chat_features"] += ["tool_choice_enforced", "single_tool_call_enforced"]
             gen_dict["chat_features"].append("prompt_overflow_refused")
             gen_dict["chat_limits"] = dict(horde_chat_limits)
             gen_dict["model_id"] = friendlymodelname
@@ -11641,7 +11692,7 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
             except Exception as e:
                 print_with_time(f"Worker {worker_id} - Chat job {current_id} could not be rendered, faulting it: {e}")
                 overflowed, chat_prompt_tokens = True, None
-                render_fault_reason = "generation_error"
+                render_fault_reason = "unbuildable_grammar" if isinstance(e, HordeGrammarError) else "generation_error"
             if overflowed:
                 if chat_prompt_tokens is not None:
                     print_with_time(f"Worker {worker_id} - Chat job {current_id} prompt of {chat_prompt_tokens} tokens does not fit its context with {current_payload.get('max_length',0)} tokens to generate, faulting it.")
@@ -11672,13 +11723,22 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         #submit reply
         print("") #empty newline
         submiturl = cluster + '/api/v2/generate/text/submit'
+        if current_generation and is_chat_job and horde_generic_tools() and horde_chat_tool_violation(current_payload, current_generation["choices"][0]["message"].get("tool_calls") or []):
+            print_with_time(f"Worker {worker_id} - Chat job {current_id} reply does not satisfy its tool_choice or parallel_tool_calls.")
+            current_generation = None #faulted below, as the declared guarantees require
+            chat_fault_reason = "tool_violation"
         if current_generation and is_chat_job:
             chat_choice = current_generation["choices"][0]
             chat_usage = current_generation.get("usage", {})
+            chat_tool_calls = chat_choice["message"].get("tool_calls") or []
+            chat_content = chat_choice["message"].get("content") or ""
+            submit_message = {"role": "assistant", "content": (None if chat_tool_calls and not chat_content else chat_content)}
+            if chat_tool_calls:
+                submit_message["tool_calls"] = chat_tool_calls
             submit_dict = {
                 "id": current_id,
-                "message": {"role": "assistant", "content": chat_choice["message"].get("content") or ""},
-                "finish_reason": ("length" if chat_choice.get("finish_reason") == "length" else "stop"),
+                "message": submit_message,
+                "finish_reason": ("tool_calls" if chat_tool_calls else ("length" if chat_choice.get("finish_reason") == "length" else "stop")),
                 "model_id": friendlymodelname,
                 "state": "ok"
             }
