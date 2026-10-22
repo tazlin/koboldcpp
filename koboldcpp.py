@@ -11529,6 +11529,24 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
     print(f"===\nEmbedded Horde Worker '{worker_name}' Starting...\n(To use your own Horde Bridge/Scribe worker instead, don't set your API key)\n")
     BRIDGE_AGENT = "KoboldCppEmbedWorker:2:https://github.com/LostRuins/koboldcpp"
     cluster = args.hordeurl.rstrip('/')
+
+    horde_ctxlimit = min(maxctx, maxctx if maxhordectx == 0 else maxhordectx)
+    horde_chat_limits = {
+        "max_context_length": horde_ctxlimit,
+        "max_length": min(maxhordelen, horde_ctxlimit - calculate_min_remain_hardlimit(horde_ctxlimit, 0)),
+    }
+
+    def horde_chat_overflows(payload):
+        # the engine silently drops the oldest context to fit, but a chat job must be refused instead
+        rendered = transform_genparams(copy.deepcopy(payload), 4, args.jinja)
+        prompt_tokens = len(tokenize_ids(rendered.get('prompt', ""), True))
+        if rendered.get('memory', ""): #the engine tokenizes memory apart from the prompt and reserves one more token beside it
+            prompt_tokens += len(tokenize_ids(rendered['memory'], True)) + 1
+        ctxlimit = tryparseint(payload.get('max_context_length', horde_ctxlimit), horde_ctxlimit)
+        genlimit = tryparseint(payload.get('max_length', args.defaultgenamt), args.defaultgenamt)
+        exceeds_horde_limits = ctxlimit > horde_chat_limits["max_context_length"] or genlimit > horde_chat_limits["max_length"]
+        return exceeds_horde_limits or prompt_tokens + genlimit > ctxlimit, prompt_tokens
+
     while exitcounter < 10:
         time.sleep(3)
         readygo = make_url_request_horde(f'{epurl}/api/v1/info/version', None,'GET',addmykey=True)
@@ -11577,6 +11595,12 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         }
         if parallel_batching_threads>1:
             gen_dict["threads"] = parallel_batching_threads
+        if args.hordechat:
+            gen_dict["chat_jobs"] = True
+            gen_dict["chat_features"] = ["seed", "presence_penalty"] #frequency_penalty is only an alias for presence_penalty here
+            gen_dict["chat_features"].append("prompt_overflow_refused")
+            gen_dict["chat_limits"] = dict(horde_chat_limits)
+            gen_dict["model_id"] = friendlymodelname
         pop = make_url_request_horde(f'{cluster}/api/v2/generate/text/pop',gen_dict)
         if not pop:
             punishcounter += 1
@@ -11594,15 +11618,38 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
         sleepy_counter = 0
         current_id = pop['id']
         current_payload = pop['payload']
+        is_chat_job = bool(pop.get('chat', False))
+        # a faulted chat submit carries a fault_reason from the horde's fixed vocabulary; a horde that does not
+        # know the field ignores it
+        chat_fault_reason = "generation_error"
         print("") #empty newline
         print_with_time(f"Job {current_id} received from {cluster} for {current_payload.get('max_length',0)} tokens and {current_payload.get('max_context_length',0)} max context. Starting generation...")
+
+        if is_chat_job:
+            try:
+                overflowed, chat_prompt_tokens = horde_chat_overflows(current_payload)
+                render_fault_reason = "prompt_overflow"
+            except Exception as e:
+                print_with_time(f"Worker {worker_id} - Chat job {current_id} could not be rendered, faulting it: {e}")
+                overflowed, chat_prompt_tokens = True, None
+                render_fault_reason = "generation_error"
+            if overflowed:
+                if chat_prompt_tokens is not None:
+                    print_with_time(f"Worker {worker_id} - Chat job {current_id} prompt of {chat_prompt_tokens} tokens does not fit its context with {current_payload.get('max_length',0)} tokens to generate, faulting it.")
+                submit_dict = {"id": current_id, "state": "faulted", "model_id": friendlymodelname, "fault_reason": render_fault_reason}
+                submit_thread = threading.Thread(target=submit_completed_generation, args=(cluster + '/api/v2/generate/text/submit', current_id, session_starttime, submit_dict))
+                submit_thread.start()
+                current_id = None
+                current_payload = None
+                continue
 
         #do gen
         while exitcounter < 10:
             if parallel_batching_threads>1 or not modelbusy.locked():
                 #horde gets a genkey to avoid KCPP overlap
                 current_payload['genkey'] = f"HORDEREQ_{random.randint(100, 999)}"
-                current_generation = make_url_request_horde(f'{epurl}/api/v1/generate', current_payload, method='POST',addmykey=True)
+                genurl = f'{epurl}/v1/chat/completions' if is_chat_job else f'{epurl}/api/v1/generate'
+                current_generation = make_url_request_horde(genurl, current_payload, method='POST',addmykey=True)
                 if current_generation:
                     break
                 else:
@@ -11615,15 +11662,35 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
 
         #submit reply
         print("") #empty newline
-        if current_generation:
+        submiturl = cluster + '/api/v2/generate/text/submit'
+        if current_generation and is_chat_job:
+            chat_choice = current_generation["choices"][0]
+            chat_usage = current_generation.get("usage", {})
+            submit_dict = {
+                "id": current_id,
+                "message": {"role": "assistant", "content": chat_choice["message"].get("content") or ""},
+                "finish_reason": ("length" if chat_choice.get("finish_reason") == "length" else "stop"),
+                "model_id": friendlymodelname,
+                "state": "ok"
+            }
+            for usage_key in ("prompt_tokens", "completion_tokens"): #a count the engine did not report is left out rather than sent as zero
+                if chat_usage.get(usage_key) is not None:
+                    submit_dict[usage_key] = chat_usage[usage_key]
+            submit_thread = threading.Thread(target=submit_completed_generation, args=(submiturl, current_id, session_starttime, submit_dict))
+            submit_thread.start() #submit job in new thread so nothing is waiting
+        elif current_generation:
             submit_dict = {
                 "id": current_id,
                 "generation": current_generation["results"][0]["text"],
                 "state": "ok"
             }
-            submiturl = cluster + '/api/v2/generate/text/submit'
             submit_thread = threading.Thread(target=submit_completed_generation, args=(submiturl, current_id, session_starttime, submit_dict))
             submit_thread.start() #submit job in new thread so nothing is waiting
+        elif is_chat_job:
+            print_with_time(f"Worker {worker_id} - Error, Chat job {current_id} failed to generate, faulting it.")
+            submit_dict = {"id": current_id, "state": "faulted", "model_id": friendlymodelname, "fault_reason": chat_fault_reason}
+            submit_thread = threading.Thread(target=submit_completed_generation, args=(submiturl, current_id, session_starttime, submit_dict))
+            submit_thread.start()
         else:
             print_with_time(f"Worker {worker_id} - Error, Abandoned current job due to errors. Getting new job.")
         current_id = None
@@ -14127,6 +14194,7 @@ if __name__ == '__main__':
     hordeparsergroup.add_argument("--hordemaxctx", metavar=('[amount]'), help="Sets the maximum context length your worker will accept from an AI Horde job. If 0, matches main context limit.", type=int, default=0)
     hordeparsergroup.add_argument("--hordegenlen", metavar=('[amount]'), help="Sets the maximum number of tokens your worker will generate from an AI horde job.", type=int, default=0)
     hordeparsergroup.add_argument("--hordeurl", metavar=('[url]'), help="Sets the AI Horde cluster your worker pops jobs from and submits them to.", default="https://aihorde.net")
+    hordeparsergroup.add_argument("--hordechat", help="Lets your AI Horde worker accept chat jobs, which are rendered with the loaded chat template.", action='store_true')
 
     sdparsergroup = parser.add_argument_group('Image Generation Commands')
     sdparsergroup.add_argument("--sdaudiovae", metavar=('[filename]'), help="Specify an image generation audio VAE for LTX2.3 video generation.", default="")
