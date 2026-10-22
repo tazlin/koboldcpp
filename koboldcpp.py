@@ -11485,10 +11485,19 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
 
     def submit_completed_generation(url, jobid, sessionstart, submit_dict):
         global exitcounter, punishcounter, session_kudos_earned, session_jobs, rewardcounter
-        reply = make_url_request_horde(url, submit_dict)
+        submit_error = {}
+        reply = make_url_request_horde(url, submit_dict, error_info=submit_error)
         if not reply:
-            punishcounter += 1
             print_with_time(f"Worker {worker_id} - Error, Job submit failed.")
+            # a 400 about the reply itself is final, and an unfaulted job stays dispatched until it times out.
+            # DuplicateGen and AbortedGen mean the job is already settled, so there is nothing to fault.
+            if "message" in submit_dict and submit_error.get("status") == 400 and submit_error.get("rc") not in ("DuplicateGen", "AbortedGen"):
+                # a refused reply that is faulted is handled work, so it does not count toward the error pause;
+                # otherwise a client sending requests the reply cannot satisfy would pause the worker
+                print_with_time(f"Worker {worker_id} - Chat job {jobid} reply was refused ({submit_error.get('rc')}), faulting it.")
+                submit_completed_generation(url, jobid, sessionstart, {"id": jobid, "state": "faulted", "model_id": friendlymodelname, "fault_reason": "reply_refused"})
+            else:
+                punishcounter += 1
         else:
             reward = reply["reward"]
             session_kudos_earned += reward
@@ -11510,12 +11519,12 @@ def run_horde_worker(args, api_key, worker_name, worker_id, parallel_batching_th
                 if exitcounter > 1:
                     exitcounter -= 1
 
-    def make_url_request_horde(url, data, method='POST',addmykey=False):
+    def make_url_request_horde(url, data, method='POST',addmykey=False,error_info=None):
         global password
         headers = headers = {"apikey": api_key,'User-Agent':'KoboldCppEmbeddedWorkerV2','Client-Agent':'KoboldCppEmbedWorker:2'}
         if addmykey and password!="":
             headers["Authorization"] = f"Bearer {password}"
-        ret = make_url_request(url, data, method, headers)
+        ret = make_url_request(url, data, method, headers, error_info=error_info)
         if not ret:
             print(f"Worker {worker_id} - Make sure your Horde API key and worker name is valid!")
         return ret

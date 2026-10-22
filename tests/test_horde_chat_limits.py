@@ -32,7 +32,7 @@ class HordeChatLimitsTests(unittest.TestCase):
 
         clock = SimpleNamespace(now=mock.Mock(side_effect=[datetime(2026, 1, 1), datetime(2026, 1, 1) + timedelta(seconds=1)]))
 
-        def request(url, data, method="POST", headers=None, timeout=600):
+        def request(url, data, method="POST", headers=None, timeout=600, error_info=None):
             if url.endswith("/api/v1/info/version"):
                 return {"result": "ok"}
             if url.endswith("/api/v2/generate/text/pop"):
